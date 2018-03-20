@@ -22,6 +22,7 @@ limitations under the License.
 #include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/gtl/array_slice.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 
 namespace tensorflow {
 namespace subgraph {
@@ -70,8 +71,13 @@ Status RewriteGraphForExecution(
     const gtl::ArraySlice<string>& target_node_names,
     const DeviceAttributes& device_info, bool use_function_convention,
     RewriteGraphMetadata* out_metadata);
+Status RewriteGraphForExecution(Graph* g,
+                                const CallableOptions& callable_options,
+                                const DeviceAttributes& device_info,
+                                bool use_function_convention,
+                                RewriteGraphMetadata* out_metadata);
 
-typedef std::unordered_map<StringPiece, Node*, StringPiece::Hasher> NameIndex;
+typedef std::unordered_map<StringPiece, Node*, StringPieceHasher> NameIndex;
 
 // Augment "*g" by adding special "fetch" nodes that connect to the
 // tensor outputs specified in "fetch_outputs" to retrieve the output

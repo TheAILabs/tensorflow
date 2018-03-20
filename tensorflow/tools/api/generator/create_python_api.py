@@ -23,14 +23,14 @@ import collections
 import os
 import sys
 
-# This import is needed so that we can traverse over TensorFlow modules.
-import tensorflow as tf  # pylint: disable=unused-import
+from tensorflow import python as tf
 from tensorflow.python.util import tf_decorator
 
 
 _API_CONSTANTS_ATTR = '_tf_api_constants'
 _API_NAMES_ATTR = '_tf_api_names'
 _API_DIR = '/api/'
+_OUTPUT_MODULE = 'tensorflow.tools.api.generator.api'
 _GENERATED_FILE_HEADER = """\"\"\"Imports for Python API.
 
 This file is MACHINE GENERATED! Do not edit.
@@ -50,11 +50,17 @@ def format_import(source_module_name, source_name, dest_name):
   Returns:
     An import statement string.
   """
-  if source_name == dest_name:
-    return 'from %s import %s' % (source_module_name, source_name)
+  if source_module_name:
+    if source_name == dest_name:
+      return 'from %s import %s' % (source_module_name, source_name)
+    else:
+      return 'from %s import %s as %s' % (
+          source_module_name, source_name, dest_name)
   else:
-    return 'from %s import %s as %s' % (
-        source_module_name, source_name, dest_name)
+    if source_name == dest_name:
+      return 'import %s' % source_name
+    else:
+      return 'import %s as %s' % (source_name, dest_name)
 
 
 def get_api_imports():
@@ -74,6 +80,9 @@ def get_api_imports():
     # Only look at tensorflow modules.
     if not module or 'tensorflow.' not in module.__name__:
       continue
+    # Do not generate __init__.py files for contrib modules for now.
+    if '.contrib.' in module.__name__ or module.__name__.endswith('.contrib'):
+      continue
 
     for module_contents_name in dir(module):
       attr = getattr(module, module_contents_name)
@@ -82,7 +91,7 @@ def get_api_imports():
       if module_contents_name == _API_CONSTANTS_ATTR:
         for exports, value in attr:
           for export in exports:
-            names = ['tf'] + export.split('.')
+            names = export.split('.')
             dest_module = '.'.join(names[:-1])
             import_str = format_import(module.__name__, value, names[-1])
             module_imports[dest_module].append(import_str)
@@ -94,28 +103,43 @@ def get_api_imports():
       if hasattr(attr, '__dict__') and _API_NAMES_ATTR in attr.__dict__:
         # The same op might be accessible from multiple modules.
         # We only want to consider location where function was defined.
-        if attr.__module__ != module.__name__:
+        # Here we check if the op is defined in another TensorFlow module in
+        # sys.modules.
+        if (hasattr(attr, '__module__') and
+            attr.__module__.startswith(tf.__name__) and
+            attr.__module__ != module.__name__ and
+            attr.__module__ in sys.modules and
+            module_contents_name in dir(sys.modules[attr.__module__])):
           continue
 
         for export in attr._tf_api_names:  # pylint: disable=protected-access
-          names = ['tf'] + export.split('.')
+          names = export.split('.')
           dest_module = '.'.join(names[:-1])
           import_str = format_import(
               module.__name__, module_contents_name, names[-1])
           module_imports[dest_module].append(import_str)
 
   # Import all required modules in their parent modules.
-  # For e.g. if we import 'tf.foo.bar.Value'. Then, we also
-  # import 'bar' in 'tf.foo'.
-  for dest_module in module_imports.keys():
-    dest_module_split = dest_module.split('.')
-    for dest_submodule_index in range(1, len(dest_module_split)):
-      dest_submodule = '.'.join(dest_module_split[:dest_submodule_index])
+  # For e.g. if we import 'foo.bar.Value'. Then, we also
+  # import 'bar' in 'foo'.
+  imported_modules = set(module_imports.keys())
+  for module in imported_modules:
+    if not module:
+      continue
+    module_split = module.split('.')
+    parent_module = ''  # we import submodules in their parent_module
+
+    for submodule_index in range(len(module_split)):
+      import_from = _OUTPUT_MODULE
+      if submodule_index > 0:
+        parent_module += ('.' + module_split[submodule_index-1] if parent_module
+                          else module_split[submodule_index-1])
+        import_from += '.' + parent_module
       submodule_import = format_import(
-          '', dest_module_split[dest_submodule_index],
-          dest_module_split[dest_submodule_index])
-      if submodule_import not in module_imports[dest_submodule]:
-        module_imports[dest_submodule].append(submodule_import)
+          import_from, module_split[submodule_index],
+          module_split[submodule_index])
+      if submodule_import not in module_imports[parent_module]:
+        module_imports[parent_module].append(submodule_import)
 
   return module_imports
 
@@ -140,8 +164,8 @@ def create_api_files(output_files):
     # First get module directory under _API_DIR.
     module_dir = os.path.dirname(
         output_file[output_file.rfind(_API_DIR)+len(_API_DIR):])
-    # Convert / to . and prefix with tf.
-    module_name = '.'.join(['tf', module_dir.replace('/', '.')]).strip('.')
+    # Convert / to .
+    module_name = module_dir.replace('/', '.').strip('.')
     module_name_to_file_path[module_name] = output_file
 
   # Create file for each expected output in genrule.
@@ -150,21 +174,26 @@ def create_api_files(output_files):
       os.makedirs(os.path.dirname(file_path))
     open(file_path, 'a').close()
 
-  # Add imports to output files.
   module_imports = get_api_imports()
+
+  # Add imports to output files.
   missing_output_files = []
   for module, exports in module_imports.items():
     # Make sure genrule output file list is in sync with API exports.
     if module not in module_name_to_file_path:
-      missing_output_files.append(module)
+      module_file_path = '"api/%s/__init__.py"' %  (
+          module.replace('.', '/'))
+      missing_output_files.append(module_file_path)
       continue
     with open(module_name_to_file_path[module], 'w') as fp:
       fp.write(_GENERATED_FILE_HEADER + '\n'.join(exports))
 
   if missing_output_files:
     raise ValueError(
-        'Missing outputs for python_api_gen genrule:\n%s' %
-        ',\n'.join(missing_output_files))
+        'Missing outputs for python_api_gen genrule:\n%s.'
+        'Make sure all required outputs are in the '
+        'tensorflow/tools/api/generator/BUILD file.' %
+        ',\n'.join(sorted(missing_output_files)))
 
 
 def main(output_files):

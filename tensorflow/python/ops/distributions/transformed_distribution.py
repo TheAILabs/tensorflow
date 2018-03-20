@@ -420,11 +420,21 @@ class TransformedDistribution(distribution_lib.Distribution):
     # modify the input.
     x = self.bijector.inverse(y)
     ildj = self.bijector.inverse_log_det_jacobian(y)
+    if self.bijector._is_injective:  # pylint: disable=protected-access
+      return self._finish_log_prob_for_one_fiber(y, x, ildj)
+
+    lp_on_fibers = [
+        self._finish_log_prob_for_one_fiber(y, x_i, ildj_i)
+        for x_i, ildj_i in zip(x, ildj)]
+    return math_ops.reduce_logsumexp(array_ops.stack(lp_on_fibers), axis=0)
+
+  def _finish_log_prob_for_one_fiber(self, y, x, ildj):
+    """Finish computation of log_prob on one element of the inverse image."""
     x = self._maybe_rotate_dims(x, rotate_right=True)
     log_prob = self.distribution.log_prob(x)
     if self._is_maybe_event_override:
       log_prob = math_ops.reduce_sum(log_prob, self._reduce_event_indices)
-    log_prob = ildj + log_prob
+    log_prob += math_ops.cast(ildj, log_prob.dtype)
     if self._is_maybe_event_override:
       log_prob.set_shape(array_ops.broadcast_static_shape(
           y.get_shape().with_rank_at_least(1)[:-1], self.batch_shape))
@@ -433,11 +443,21 @@ class TransformedDistribution(distribution_lib.Distribution):
   def _prob(self, y):
     x = self.bijector.inverse(y)
     ildj = self.bijector.inverse_log_det_jacobian(y)
+    if self.bijector._is_injective:  # pylint: disable=protected-access
+      return self._finish_prob_for_one_fiber(y, x, ildj)
+
+    prob_on_fibers = [
+        self._finish_prob_for_one_fiber(y, x_i, ildj_i)
+        for x_i, ildj_i in zip(x, ildj)]
+    return sum(prob_on_fibers)
+
+  def _finish_prob_for_one_fiber(self, y, x, ildj):
+    """Finish computation of prob on one element of the inverse image."""
     x = self._maybe_rotate_dims(x, rotate_right=True)
     prob = self.distribution.prob(x)
     if self._is_maybe_event_override:
       prob = math_ops.reduce_prod(prob, self._reduce_event_indices)
-    prob *= math_ops.exp(ildj)
+    prob *= math_ops.exp(math_ops.cast(ildj, prob.dtype))
     if self._is_maybe_event_override:
       prob.set_shape(array_ops.broadcast_static_shape(
           y.get_shape().with_rank_at_least(1)[:-1], self.batch_shape))
@@ -447,6 +467,9 @@ class TransformedDistribution(distribution_lib.Distribution):
     if self._is_maybe_event_override:
       raise NotImplementedError("log_cdf is not implemented when overriding "
                                 "event_shape")
+    if not self.bijector._is_injective:  # pylint: disable=protected-access
+      raise NotImplementedError("log_cdf is not implemented when "
+                                "bijector is not injective.")
     x = self.bijector.inverse(y)
     return self.distribution.log_cdf(x)
 
@@ -454,6 +477,9 @@ class TransformedDistribution(distribution_lib.Distribution):
     if self._is_maybe_event_override:
       raise NotImplementedError("cdf is not implemented when overriding "
                                 "event_shape")
+    if not self.bijector._is_injective:  # pylint: disable=protected-access
+      raise NotImplementedError("cdf is not implemented when "
+                                "bijector is not injective.")
     x = self.bijector.inverse(y)
     return self.distribution.cdf(x)
 
@@ -461,6 +487,9 @@ class TransformedDistribution(distribution_lib.Distribution):
     if self._is_maybe_event_override:
       raise NotImplementedError("log_survival_function is not implemented when "
                                 "overriding event_shape")
+    if not self.bijector._is_injective:  # pylint: disable=protected-access
+      raise NotImplementedError("log_survival_function is not implemented when "
+                                "bijector is not injective.")
     x = self.bijector.inverse(y)
     return self.distribution.log_survival_function(x)
 
@@ -468,12 +497,31 @@ class TransformedDistribution(distribution_lib.Distribution):
     if self._is_maybe_event_override:
       raise NotImplementedError("survival_function is not implemented when "
                                 "overriding event_shape")
+    if not self.bijector._is_injective:  # pylint: disable=protected-access
+      raise NotImplementedError("survival_function is not implemented when "
+                                "bijector is not injective.")
     x = self.bijector.inverse(y)
     return self.distribution.survival_function(x)
+
+  def _quantile(self, value):
+    if self._is_maybe_event_override:
+      raise NotImplementedError("quantile is not implemented when overriding "
+                                "event_shape")
+    if not self.bijector._is_injective:  # pylint: disable=protected-access
+      raise NotImplementedError("quantile is not implemented when "
+                                "bijector is not injective.")
+    # x_q is the "qth quantile" of X iff q = P[X <= x_q].  Now, since X =
+    # g^{-1}(Y), q = P[X <= x_q] = P[g^{-1}(Y) <= x_q] = P[Y <= g(x_q)],
+    # implies the qth quantile of Y is g(x_q).
+    inv_cdf = self.distribution.quantile(value)
+    return self.bijector.forward(inv_cdf)
 
   def _entropy(self):
     if not self.bijector.is_constant_jacobian:
       raise NotImplementedError("entropy is not implemented")
+    if not self.bijector._is_injective:  # pylint: disable=protected-access
+      raise NotImplementedError("entropy is not implemented when "
+                                "bijector is not injective.")
     # Suppose Y = g(X) where g is a diffeomorphism and X is a continuous rv. It
     # can be shown that:
     #   H[Y] = H[X] + E_X[(log o abs o det o J o g)(X)].
@@ -498,7 +546,9 @@ class TransformedDistribution(distribution_lib.Distribution):
       ], 0)
       entropy = array_ops.tile(entropy, multiples)
     dummy = array_ops.zeros([], self.dtype)
-    entropy -= self.bijector.inverse_log_det_jacobian(dummy)
+    entropy -= math_ops.cast(
+        self.bijector.inverse_log_det_jacobian(dummy),
+        entropy.dtype)
     entropy.set_shape(self.batch_shape)
     return entropy
 
